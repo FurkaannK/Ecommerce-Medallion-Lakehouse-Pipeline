@@ -1,0 +1,10 @@
+version: 2
+
+sources:
+  - name: silver
+    description: "Cleaned and validated Parquet files stored in MinIO Silver bucket"
+    tables:
+      - name: orders
+        description: "Granular line-item orders table partitioned by date"
+        meta:
+          external_location: "s3://ecommerce-silver/orders/**/*.parquet"
