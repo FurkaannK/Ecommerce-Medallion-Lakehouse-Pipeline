@@ -1,0 +1,56 @@
+version: 2
+
+models:
+  - name: dim_customers
+    description: "Customer dimension table containing aggregated lifetime purchase metrics."
+    columns:
+      - name: customer_id
+        description: "Primary key for customer dimension."
+        data_tests:
+          - not_null
+          - unique
+      - name: total_orders_placed
+        description: "Count of unique orders placed by customer."
+        data_tests:
+          - not_null
+
+  - name: dim_products
+    description: "Product dimension table with aggregate sales statistics."
+    columns:
+      - name: product_id
+        description: "Primary key for product dimension."
+        data_tests:
+          - not_null
+          - unique
+      - name: total_units_sold
+        data_tests:
+          - not_null
+
+  - name: fct_orders
+    description: "Fact table recording granular order line-item transactions."
+    columns:
+      - name: order_id
+        description: "Order unique identifier."
+        data_tests:
+          - not_null
+      - name: order_status
+        description: "Status of the order transaction."
+        data_tests:
+          - not_null
+          - accepted_values:
+              arguments:
+                values: ['completed', 'cancelled', 'returned']
+      - name: customer_id
+        description: "Foreign key referencing dim_customers."
+        data_tests:
+          - not_null
+
+  - name: mart_daily_sales
+    description: "Aggregated daily sales and order performance metrics mart."
+    columns:
+      - name: order_date
+        data_tests:
+          - not_null
+      - name: gross_sales
+        data_tests:
+          - not_null

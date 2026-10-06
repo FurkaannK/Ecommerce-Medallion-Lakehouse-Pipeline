@@ -1,7 +1,7 @@
 """
 DAG: E-Commerce Medallion Lakehouse Orchestration Pipeline
 Modern Airflow 2.x TaskFlow API implementation.
-Orchestrates Bronze Ingestion -> Silver Parquet Transformation -> Gold dbt Marts.
+Orchestrates Bronze Ingestion -> Silver Parquet Transformation -> Gold dbt Marts (with Data Quality Tests).
 """
 
 from datetime import datetime, timedelta
@@ -53,10 +53,10 @@ def ecommerce_lakehouse_pipeline():
         logger.info(f"Successfully processed {len(processed_keys)} files to Silver layer.")
         return processed_keys
 
-    @task.bash(task_id="dbt_run_gold_models")
+    @task.bash(task_id="dbt_build_gold_models_and_tests")
     def task_dbt() -> str:
-        """Executes dbt models using DuckDB to materialize Gold dimensional tables into MinIO."""
-        return "dbt run --project-dir /opt/airflow/dbt --profiles-dir /opt/airflow/dbt"
+        """Executes dbt build (runs models + data quality tests) via DuckDB into MinIO."""
+        return "dbt build --project-dir /opt/airflow/dbt --profiles-dir /opt/airflow/dbt"
 
     # Define clean pipeline execution dependencies
     ingest_result = task_ingest()
