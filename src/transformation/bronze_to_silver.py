@@ -1,14 +1,14 @@
 """
-Bronze to Silver Transformation Module
+Bronze to Silver Transformation Module with Data Quality Firewall & Quarantine Mechanism
 Reads raw JSON batches from Bronze S3 bucket, flattens nested structures,
-enforces schema and data quality, and writes optimized Parquet files into Silver S3 bucket.
+validates against data quality rules, writes clean records to Silver and quarantined records to a separate DLQ folder.
 """
 
 import io
 import json
 import logging
 from datetime import datetime, timezone
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Tuple
 
 import pandas as pd
 import pyarrow as pa
@@ -21,6 +21,8 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(name)s - %(message)s"
 )
 logger = logging.getLogger("SilverTransformation")
+
+VALID_ORDER_STATUSES = {"completed", "cancelled", "returned"}
 
 
 def list_bronze_json_files(prefix: str = "orders/") -> List[str]:
@@ -50,7 +52,7 @@ def flatten_order_batch(raw_orders: List[Dict[str, Any]]) -> pd.DataFrame:
         created_at = order.get("created_at")
         order_status = order.get("order_status")
         
-        customer = order.get("customer", {})
+        customer = order.get("customer") or {}
         customer_id = customer.get("customer_id")
         customer_name = f"{customer.get('first_name', '')} {customer.get('last_name', '')}".strip()
         customer_email = customer.get("email")
@@ -58,7 +60,7 @@ def flatten_order_batch(raw_orders: List[Dict[str, Any]]) -> pd.DataFrame:
         customer_state = customer.get("state")
         customer_country = customer.get("country")
         
-        payment = order.get("payment", {})
+        payment = order.get("payment") or {}
         payment_method = payment.get("payment_method")
         currency = payment.get("currency")
         order_total_amount = float(payment.get("total_amount", 0.0))
@@ -66,7 +68,7 @@ def flatten_order_batch(raw_orders: List[Dict[str, Any]]) -> pd.DataFrame:
         tax_amount = float(payment.get("tax_amount", 0.0))
         
         # Unnest items (Order Line Items)
-        items = order.get("items", [])
+        items = order.get("items") or []
         for item in items:
             product_id = item.get("product_id")
             product_name = item.get("product_name")
@@ -80,7 +82,7 @@ def flatten_order_batch(raw_orders: List[Dict[str, Any]]) -> pd.DataFrame:
                 "order_status": order_status,
                 "order_timestamp": created_at,
                 "customer_id": customer_id,
-                "customer_name": customer_name,
+                "customer_name": customer_name if customer_name else None,
                 "customer_email": customer_email,
                 "customer_city": customer_city,
                 "customer_state": customer_state,
@@ -99,11 +101,9 @@ def flatten_order_batch(raw_orders: List[Dict[str, Any]]) -> pd.DataFrame:
             })
             
     df = pd.DataFrame(rows)
-    
     if df.empty:
         return df
 
-    # Enforce data types & data hygiene
     df["order_timestamp"] = pd.to_datetime(df["order_timestamp"], utc=True)
     df["quantity"] = df["quantity"].astype("int32")
     df["unit_price"] = df["unit_price"].astype("float64")
@@ -111,69 +111,115 @@ def flatten_order_batch(raw_orders: List[Dict[str, Any]]) -> pd.DataFrame:
     df["order_total_amount"] = df["order_total_amount"].astype("float64")
     df["shipping_fee"] = df["shipping_fee"].astype("float64")
     df["tax_amount"] = df["tax_amount"].astype("float64")
-    
-    # Audit column for lineage
     df["silver_processed_at"] = datetime.now(timezone.utc)
     
     return df
 
 
-def process_bronze_file_to_silver(s3_key: str) -> str:
+def validate_and_split_data(df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame]:
     """
-    Downloads a single raw JSON from Bronze, transforms it to Parquet,
-    and uploads to Silver bucket using hive partitioning.
+    Data Quality Firewall:
+    Validates records against business rules and splits into clean_df and quarantine_df.
+    Rules:
+      1. order_total_amount must be > 0
+      2. line_item_total must be > 0
+      3. customer_id cannot be null or empty
+      4. order_status must be in VALID_ORDER_STATUSES
+    """
+    if df.empty:
+        return df, pd.DataFrame()
+
+    rejection_reasons = []
+
+    for _, row in df.iterrows():
+        reasons = []
+        if pd.isna(row["customer_id"]) or str(row["customer_id"]).strip() == "":
+            reasons.append("MISSING_CUSTOMER_ID")
+        if row["order_total_amount"] <= 0:
+            reasons.append("NEGATIVE_OR_ZERO_ORDER_TOTAL")
+        if row["line_item_total"] <= 0:
+            reasons.append("NEGATIVE_OR_ZERO_LINE_ITEM")
+        if row["order_status"] not in VALID_ORDER_STATUSES:
+            reasons.append(f"INVALID_STATUS_{row['order_status']}")
+
+        rejection_reasons.append("; ".join(reasons) if reasons else None)
+
+    df["rejection_reason"] = rejection_reasons
+
+    clean_df = df[df["rejection_reason"].isna()].copy().drop(columns=["rejection_reason"])
+    quarantine_df = df[df["rejection_reason"].notna()].copy()
+
+    return clean_df, quarantine_df
+
+
+def upload_dataframe_to_parquet(df: pd.DataFrame, bucket: str, s3_key: str):
+    """Encodes a DataFrame into Snappy Parquet and uploads to S3."""
+    s3_client = get_s3_client()
+    table = pa.Table.from_pandas(df)
+    buffer = io.BytesIO()
+    pq.write_table(table, buffer, compression="SNAPPY")
+    buffer.seek(0)
+    
+    s3_client.put_object(
+        Bucket=bucket,
+        Key=s3_key,
+        Body=buffer.getvalue(),
+        ContentType="application/octet-stream"
+    )
+
+
+def process_bronze_file_to_silver(s3_key: str) -> Dict[str, Any]:
+    """
+    Processes a single Bronze file:
+    Writes clean records to orders/ and quarantined records to quarantine/.
     """
     s3_client = get_s3_client()
-    logger.info(f"Processing Bronze file: s3://{BRONZE_BUCKET}/{s3_key}")
-    
-    # Download JSON content from Bronze
     response = s3_client.get_object(Bucket=BRONZE_BUCKET, Key=s3_key)
     raw_content = response["Body"].read().decode("utf-8")
     orders_data = json.loads(raw_content)
-    
-    # Transform & Flatten
+
     df = flatten_order_batch(orders_data)
     if df.empty:
-        logger.warning(f"No orders found in {s3_key}. Skipping.")
-        return ""
-    
-    # Generate Silver Parquet Key
-    # Replace .json with .parquet and change bucket namespace
-    parquet_key = s3_key.replace(".json", ".parquet")
-    
-    # Convert DataFrame to Parquet in-memory buffer
-    table = pa.Table.from_pandas(df)
-    parquet_buffer = io.BytesIO()
-    pq.write_table(table, parquet_buffer, compression="SNAPPY")
-    parquet_buffer.seek(0)
-    
-    # Upload to Silver bucket
-    logger.info(f"Writing Silver Parquet ({len(df)} records) to s3://{SILVER_BUCKET}/{parquet_key}")
-    s3_client.put_object(
-        Bucket=SILVER_BUCKET,
-        Key=parquet_key,
-        Body=parquet_buffer.getvalue(),
-        ContentType="application/octet-stream"
-    )
-    
-    logger.info(f"Successfully written to Silver: s3://{SILVER_BUCKET}/{parquet_key}")
-    return parquet_key
+        return {"clean_key": None, "quarantine_key": None, "clean_count": 0, "quarantine_count": 0}
+
+    clean_df, quarantine_df = validate_and_split_data(df)
+
+    clean_key = None
+    if not clean_df.empty:
+        clean_key = s3_key.replace(".json", ".parquet")
+        upload_dataframe_to_parquet(clean_df, SILVER_BUCKET, clean_key)
+        logger.info(f"Clean records ({len(clean_df)}) written to s3://{SILVER_BUCKET}/{clean_key}")
+
+    quarantine_key = None
+    if not quarantine_df.empty:
+        # Save into quarantine folder hierarchy
+        quarantine_key = s3_key.replace("orders/", "quarantine/").replace(".json", "_quarantined.parquet")
+        upload_dataframe_to_parquet(quarantine_df, SILVER_BUCKET, quarantine_key)
+        logger.warning(
+            f"QUARANTINE ALERT: {len(quarantine_df)} anomalous records isolated in s3://{SILVER_BUCKET}/{quarantine_key}"
+        )
+
+    return {
+        "clean_key": clean_key,
+        "quarantine_key": quarantine_key,
+        "clean_count": len(clean_df),
+        "quarantine_count": len(quarantine_df),
+    }
 
 
-def process_all_bronze_to_silver() -> List[str]:
-    """Batch processes all available Bronze JSON files into Silver Parquet files."""
+def process_all_bronze_to_silver() -> Dict[str, int]:
+    """Processes all Bronze files and returns total counts."""
     json_files = list_bronze_json_files()
-    if not json_files:
-        logger.info("No Bronze files found to process.")
-        return []
-    
-    logger.info(f"Found {len(json_files)} Bronze files to process.")
-    silver_keys = []
+    total_clean = 0
+    total_quarantined = 0
+
     for key in json_files:
-        silver_key = process_bronze_file_to_silver(key)
-        if silver_key:
-            silver_keys.append(silver_key)
-    return silver_keys
+        stats = process_bronze_file_to_silver(key)
+        total_clean += stats["clean_count"]
+        total_quarantined += stats["quarantine_count"]
+
+    logger.info(f"Batch transformation summary: {total_clean} clean records, {total_quarantined} quarantined records.")
+    return {"total_clean": total_clean, "total_quarantined": total_quarantined}
 
 
 if __name__ == "__main__":
