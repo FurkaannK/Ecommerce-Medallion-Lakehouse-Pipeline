@@ -1,18 +1,20 @@
 """
-Bronze to Silver Transformation Module with Data Quality Firewall & Quarantine Mechanism
-Reads raw JSON batches from Bronze S3 bucket, flattens nested structures,
-validates against data quality rules, writes clean records to Silver and quarantined records to a separate DLQ folder.
+Bronze to Silver Transformation Module with Data Quality Firewall & Incremental State Tracking
+Reads ONLY NEW (unprocessed) raw JSON batches from Bronze S3 bucket using a checkpoint metadata file,
+flattens nested structures, validates against data quality rules, and writes clean records to Silver
+while routing anomalies to quarantine (DLQ).
 """
 
 import io
 import json
 import logging
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Set, Tuple
 
 import pandas as pd
 import pyarrow as pa
 import pyarrow.parquet as pq
+from botocore.exceptions import ClientError
 
 from config.s3_config import BRONZE_BUCKET, SILVER_BUCKET, get_s3_client
 
@@ -23,6 +25,43 @@ logging.basicConfig(
 logger = logging.getLogger("SilverTransformation")
 
 VALID_ORDER_STATUSES = {"completed", "cancelled", "returned"}
+METADATA_CHECKPOINT_KEY = "_metadata/processed_files.json"
+
+
+def get_processed_files() -> Set[str]:
+    """
+    Reads the incremental checkpoint file from Silver bucket to identify
+    which Bronze files have already been processed.
+    """
+    s3_client = get_s3_client()
+    try:
+        response = s3_client.get_object(Bucket=SILVER_BUCKET, Key=METADATA_CHECKPOINT_KEY)
+        data = json.loads(response["Body"].read().decode("utf-8"))
+        return set(data.get("processed_files", []))
+    except ClientError as e:
+        error_code = e.response.get("Error", {}).get("Code")
+        if error_code in ("NoSuchKey", "404"):
+            logger.info("No checkpoint metadata found. Initializing empty processed file registry.")
+            return set()
+        logger.error(f"Error fetching checkpoint metadata: {e}")
+        return set()
+
+
+def save_processed_files(processed_files: Set[str]) -> None:
+    """Updates the incremental checkpoint file in Silver bucket."""
+    s3_client = get_s3_client()
+    payload = {
+        "last_updated_at": datetime.now(timezone.utc).isoformat(),
+        "total_files_processed": len(processed_files),
+        "processed_files": sorted(list(processed_files)),
+    }
+    s3_client.put_object(
+        Bucket=SILVER_BUCKET,
+        Key=METADATA_CHECKPOINT_KEY,
+        Body=json.dumps(payload, indent=2).encode("utf-8"),
+        ContentType="application/json",
+    )
+    logger.info(f"Updated incremental checkpoint with {len(processed_files)} processed files.")
 
 
 def list_bronze_json_files(prefix: str = "orders/") -> List[str]:
@@ -67,7 +106,6 @@ def flatten_order_batch(raw_orders: List[Dict[str, Any]]) -> pd.DataFrame:
         shipping_fee = float(payment.get("shipping_fee", 0.0))
         tax_amount = float(payment.get("tax_amount", 0.0))
         
-        # Unnest items (Order Line Items)
         items = order.get("items") or []
         for item in items:
             product_id = item.get("product_id")
@@ -120,11 +158,6 @@ def validate_and_split_data(df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFram
     """
     Data Quality Firewall:
     Validates records against business rules and splits into clean_df and quarantine_df.
-    Rules:
-      1. order_total_amount must be > 0
-      2. line_item_total must be > 0
-      3. customer_id cannot be null or empty
-      4. order_status must be in VALID_ORDER_STATUSES
     """
     if df.empty:
         return df, pd.DataFrame()
@@ -169,10 +202,7 @@ def upload_dataframe_to_parquet(df: pd.DataFrame, bucket: str, s3_key: str):
 
 
 def process_bronze_file_to_silver(s3_key: str) -> Dict[str, Any]:
-    """
-    Processes a single Bronze file:
-    Writes clean records to orders/ and quarantined records to quarantine/.
-    """
+    """Processes a single Bronze file and isolates anomalies into quarantine/."""
     s3_client = get_s3_client()
     response = s3_client.get_object(Bucket=BRONZE_BUCKET, Key=s3_key)
     raw_content = response["Body"].read().decode("utf-8")
@@ -192,7 +222,6 @@ def process_bronze_file_to_silver(s3_key: str) -> Dict[str, Any]:
 
     quarantine_key = None
     if not quarantine_df.empty:
-        # Save into quarantine folder hierarchy
         quarantine_key = s3_key.replace("orders/", "quarantine/").replace(".json", "_quarantined.parquet")
         upload_dataframe_to_parquet(quarantine_df, SILVER_BUCKET, quarantine_key)
         logger.warning(
@@ -208,18 +237,44 @@ def process_bronze_file_to_silver(s3_key: str) -> Dict[str, Any]:
 
 
 def process_all_bronze_to_silver() -> Dict[str, int]:
-    """Processes all Bronze files and returns total counts."""
-    json_files = list_bronze_json_files()
+    """
+    Incremental Processing:
+    Fetches only NEW/UNPROCESSED Bronze JSON files, transforms them,
+    and updates the checkpoint state in Silver bucket.
+    """
+    all_json_files = set(list_bronze_json_files())
+    processed_files = get_processed_files()
+
+    # Calculate delta: only files that haven't been processed yet
+    new_files = sorted(list(all_json_files - processed_files))
+
+    if not new_files:
+        logger.info("Incremental Check: No new Bronze files to process. Everything is up to date!")
+        return {"total_clean": 0, "total_quarantined": 0, "new_files_processed": 0}
+
+    logger.info(f"Incremental Check: Found {len(new_files)} new unprocessed Bronze files (out of {len(all_json_files)} total).")
+    
     total_clean = 0
     total_quarantined = 0
 
-    for key in json_files:
+    for key in new_files:
         stats = process_bronze_file_to_silver(key)
         total_clean += stats["clean_count"]
         total_quarantined += stats["quarantine_count"]
+        processed_files.add(key)
 
-    logger.info(f"Batch transformation summary: {total_clean} clean records, {total_quarantined} quarantined records.")
-    return {"total_clean": total_clean, "total_quarantined": total_quarantined}
+    # Persist updated state checkpoint
+    save_processed_files(processed_files)
+
+    logger.info(
+        f"Incremental Transformation complete: {len(new_files)} files processed, "
+        f"{total_clean} clean records, {total_quarantined} quarantined records."
+    )
+    return {
+        "total_clean": total_clean,
+        "total_quarantined": total_quarantined,
+        "new_files_processed": len(new_files),
+    }
 
 
 if __name__ == "__main__":
