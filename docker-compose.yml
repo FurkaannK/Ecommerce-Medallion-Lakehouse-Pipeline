@@ -23,6 +23,7 @@ x-airflow-common: &airflow-common
     - ./src:/opt/airflow/src
     - ./config:/opt/airflow/config
     - ./dbt:/opt/airflow/dbt
+    - ./airflow/logs:/opt/airflow/logs
   depends_on:
     postgres:
       condition: service_healthy
