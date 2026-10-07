@@ -30,6 +30,13 @@ dbt_packages/
 .idea/
 *.swp
 
+# Airflow Logs & Runtime Data
+airflow/logs/
+*.log
+
+# Power BI & Local Data Exports
+data/
+
 # OS generated files
 .DS_Store
 Thumbs.db
