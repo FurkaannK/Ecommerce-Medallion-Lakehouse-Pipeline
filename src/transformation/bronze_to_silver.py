@@ -150,7 +150,14 @@ def flatten_order_batch(raw_orders: List[Dict[str, Any]]) -> pd.DataFrame:
     df["shipping_fee"] = df["shipping_fee"].astype("float64")
     df["tax_amount"] = df["tax_amount"].astype("float64")
     df["silver_processed_at"] = datetime.now(timezone.utc)
-    
+
+    # Idempotency guarantee: Deduplicate line items by primary composite key (order_id + product_id)
+    initial_count = len(df)
+    df = df.drop_duplicates(subset=["order_id", "product_id"], keep="last")
+    deduped_count = initial_count - len(df)
+    if deduped_count > 0:
+        logger.warning(f"Idempotency filter: Removed {deduped_count} duplicate records from current batch.")
+
     return df
 
 
